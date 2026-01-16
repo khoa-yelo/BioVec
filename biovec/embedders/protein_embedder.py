@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import re
+import time
+from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from transformers import AutoModel, AutoTokenizer, T5EncoderModel, T5Tokenizer
+
+import yaml
+from tqdm import tqdm
+from Bio import SeqIO
+
+from ..io.h5 import write_h5
 
 
 ModelType = Literal["esm2", "t5", "glm2"]
@@ -23,6 +31,39 @@ class EmbedderConfig:
     max_length: int = 2048
     layer: LayerSpec = "last"              # used for esm2 + t5; glm2 uses pooler_output
     trust_remote_code: bool = True
+
+    @staticmethod
+    def _parse_dtype(value: Optional[str]) -> Optional[torch.dtype]:
+        if value is None:
+            return None
+        mapping = {
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+        }
+        if value not in mapping:
+            raise ValueError(f"Unsupported dtype string: {value}")
+        return mapping[value]
+
+    @classmethod
+    def from_yaml(cls, path: Union[str, Path]) -> "EmbedderConfig":
+        if yaml is None:
+            raise ImportError("pyyaml is required to load EmbedderConfig from YAML.")
+        with open(path, "r") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            raise ValueError("YAML must define a mapping of config fields.")
+        if "dtype" in data and isinstance(data["dtype"], str):
+            data["dtype"] = cls._parse_dtype(data["dtype"])
+        return cls(**data)
+
+    @classmethod
+    def from_template(cls, name: str) -> "EmbedderConfig":
+        template_path = Path(__file__).parent / "templates" / f"{name}.yaml"
+        return cls.from_yaml(template_path)
 
 
 class ProteinEmbedder:
@@ -41,7 +82,7 @@ class ProteinEmbedder:
 
         if cfg.model_type == "t5":
             self.tokenizer = T5Tokenizer.from_pretrained(cfg.hub_id, do_lower_case=False)
-            self.model = T5EncoderModel.from_pretrained(cfg.hub_id, torch_dtype=cfg.dtype)
+            self.model = T5EncoderModel.from_pretrained(cfg.hub_id, dtype=cfg.dtype)
         else:
             # esm2 + glm2 both work with Auto*
             self.tokenizer = AutoTokenizer.from_pretrained(cfg.hub_id, trust_remote_code=cfg.trust_remote_code)
@@ -55,6 +96,7 @@ class ProteinEmbedder:
         *,
         batch_size: Optional[int] = None,
         return_numpy: bool = True,
+        verbose: bool = True,
     ) -> Union[np.ndarray, torch.Tensor]:
         single = isinstance(sequences, str)
         seqs: List[str] = [sequences] if single else list(sequences)
@@ -62,8 +104,20 @@ class ProteinEmbedder:
         bs = batch_size or self.cfg.batch_size
         outs: List[torch.Tensor] = []
 
+        if verbose:
+            model_name = self.cfg.hub_id
+            model_type = self.cfg.model_type
+            device = str(self.device)
+            print(f"[ProteinEmbedder] model={model_type} hub_id={model_name}")
+            print(f"[ProteinEmbedder] device={device} batch_size={bs} sequences={len(seqs)}")
+
+        start = time.time()
+        iterator = range(0, len(seqs), bs)
+        if verbose and tqdm is not None:
+            iterator = tqdm(iterator, desc="Embedding", unit="batch")
+
         with torch.no_grad():
-            for i in range(0, len(seqs), bs):
+            for i in iterator:
                 batch = seqs[i : i + bs]
                 outs.append(self._embed_batch(batch).cpu())
 
@@ -74,8 +128,16 @@ class ProteinEmbedder:
             # numpy doesn't support bfloat16 -> cast first
             if embs.dtype == torch.bfloat16:
                 embs = embs.float()
-            return embs.numpy()
-        return embs
+            out = embs.numpy()
+        else:
+            out = embs
+
+        if verbose:
+            elapsed = time.time() - start
+            total = len(seqs)
+            per_s = total / elapsed if elapsed > 0 else 0.0
+            print(f"[ProteinEmbedder] done in {elapsed:.2f}s ({per_s:.1f} seq/s)")
+        return out
     # ---------- internals ----------
 
     def _embed_batch(self, seqs: List[str]) -> torch.Tensor:
@@ -170,6 +232,77 @@ class ProteinEmbedder:
         summed = (hidden * mask).sum(dim=1)                   # (B, H)
         denom = mask.sum(dim=1).clamp(min=1e-6)               # (B, 1)
         return summed / denom
+
+
+def embed_protein(
+    embedder_config: Union[str, EmbedderConfig],
+    *,
+    fasta_file: Optional[str] = None,
+    sequences: Optional[Sequence[str]] = None,
+    save_h5: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Embed protein sequences from a FASTA file or a list of sequences.
+
+    Args:
+        embedder_config: YAML path, template name, or EmbedderConfig object.
+        fasta_file: path to FASTA file.
+        sequences: list of protein sequences.
+        save_h5: optional output H5 path. Stores datasets: matrix, ids, descriptions.
+        batch_size: override embedder batch size.
+        verbose: print progress and config info.
+    Returns:
+        Dict with keys: matrix, ids, descriptions
+    """
+    if (fasta_file is None and sequences is None) or (fasta_file and sequences):
+        raise ValueError("Provide exactly one of fasta_file or sequences.")
+
+    if isinstance(embedder_config, EmbedderConfig):
+        cfg = embedder_config
+    elif isinstance(embedder_config, str):
+        if embedder_config.endswith(".yaml") or embedder_config.endswith(".yml"):
+            cfg = EmbedderConfig.from_yaml(embedder_config)
+        else:
+            cfg = EmbedderConfig.from_template(embedder_config)
+    else:
+        raise ValueError("embedder_config must be a YAML path, template name, or EmbedderConfig.")
+
+    ids: List[str] = []
+    descriptions: List[str] = []
+    seqs: List[str] = []
+
+    if fasta_file is not None:
+        for rec in SeqIO.parse(fasta_file, "fasta"):
+            ids.append(rec.id)
+            descriptions.append(getattr(rec, "description", "") or "")
+            seqs.append(str(rec.seq))
+    else:
+        seqs = list(sequences or [])
+        ids = [f"seq_{i}" for i in range(len(seqs))]
+        descriptions = [""] * len(seqs)
+
+    if not seqs:
+        return {"matrix": np.zeros((0, 0), dtype=np.float32), "ids": [], "descriptions": []}
+
+    embedder = ProteinEmbedder(cfg)
+    matrix = np.asarray(
+        embedder.embed(seqs, batch_size=batch_size, return_numpy=True, verbose=verbose),
+        dtype=np.float32,
+    )
+
+    if save_h5:
+        write_h5(
+            save_h5,
+            {
+                "matrix": matrix,
+                "ids": np.asarray(ids, dtype=object),
+                "descriptions": np.asarray(descriptions, dtype=object),
+            },
+        )
+
+    return {"matrix": matrix, "ids": ids, "descriptions": descriptions}
 
 
 if __name__ == "__main__":

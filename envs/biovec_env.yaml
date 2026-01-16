@@ -1,0 +1,39 @@
+name: biovec_env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+
+  # GPU-enabled PyTorch
+  - pytorch=2.1
+  - torchvision
+  - torchaudio
+  - pytorch-cuda
+
+  # FAISS-GPU 
+  - faiss-gpu
+
+  # NLP / utils
+  - transformers
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - plotly
+  - gdown
+  - biopython
+  - h5py
+  
+  - pip:
+      - torchtext
+      - datasets
+      - scikit-learn
+      - einops
+      - tiktoken
+      - protobuf
+      - sentencepiece

@@ -1,0 +1,9 @@
+model_type: esm2
+hub_id: facebook/esm2_t33_650M_UR50D
+device: null
+dtype: float16
+batch_size: 8
+max_length: 2048
+layer: last
+trust_remote_code: true
+

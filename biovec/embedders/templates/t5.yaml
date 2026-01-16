@@ -1,0 +1,9 @@
+model_type: t5
+hub_id: Rostlab/prot_t5_xl_half_uniref50-enc
+device: null
+dtype: float16
+batch_size: 8
+max_length: 2048
+layer: middle
+trust_remote_code: true
+

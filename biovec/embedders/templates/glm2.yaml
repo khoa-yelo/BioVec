@@ -1,0 +1,9 @@
+model_type: glm2
+hub_id: tattabio/gLM2_650M_embed
+device: null
+dtype: bfloat16
+batch_size: 8
+max_length: 2048
+layer: last
+trust_remote_code: true
+
