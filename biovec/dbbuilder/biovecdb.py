@@ -127,8 +127,10 @@ class BioVecDB:
     def save(self, base_path: str) -> None:
         """Save index and metadata to disk."""
         self.indexer.save(f"{base_path}.faiss")
+        # Convert EmbedderConfig to dict for JSON serialization
+        cfg = self.embedder_config.to_dict() if isinstance(self.embedder_config, EmbedderConfig) else self.embedder_config
         with open(f"{base_path}.meta.json", "w") as f:
-            json.dump({"metadata": self.metadata, "embedder_config": self.embedder_config}, f)
+            json.dump({"metadata": self.metadata, "embedder_config": cfg}, f)
 
     @classmethod
     def load(cls, base_path: str, use_gpu: bool = True, metric: str = "cosine") -> "BioVecDB":

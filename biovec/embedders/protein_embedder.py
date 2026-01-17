@@ -65,6 +65,20 @@ class EmbedderConfig:
         template_path = Path(__file__).parent / "templates" / f"{name}.yaml"
         return cls.from_yaml(template_path)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert config to a JSON/YAML-serializable dict."""
+        from dataclasses import asdict
+        d = asdict(self)
+        # Convert torch.dtype to string
+        if d.get("dtype") is not None:
+            d["dtype"] = str(d["dtype"]).replace("torch.", "")
+        return d
+
+    def save_yaml(self, path: Union[str, Path]) -> None:
+        """Save config to a YAML file."""
+        with open(path, "w") as f:
+            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
+
 
 class ProteinEmbedder:
     """
