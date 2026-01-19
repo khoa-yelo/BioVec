@@ -1,63 +1,27 @@
+"""
+BioVecDB: Protein embedding database built on FAISS for semantic search.
+"""
+
 import json
 import os
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 
-from ..embedders.protein_embedder import EmbedderConfig, ProteinEmbedder, embed_protein
+from ..embedders.protein_embedder import EmbedderConfig, ProteinEmbedder
 from ..indexer.faiss_indexer import FaissIndexer
 from ..io.fasta import read_fasta
 from ..io.h5 import write_h5
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from .utils import (
+    ensure_2d,
+    embed_sequences,
+    format_hits,
+    load_sequences,
+    get_fasta_path,
+    save_sequences,
+)
 
-def _ensure_2d(arr: np.ndarray) -> np.ndarray:
-    """Ensure array is 2D (N, D)."""
-    arr = np.asarray(arr, dtype=np.float32)
-    return arr.reshape(1, -1) if arr.ndim == 1 else arr
-
-
-def _embed_sequences(
-    seqs: List[str],
-    embedder: Optional[ProteinEmbedder],
-    embedder_config: Optional[Union[str, EmbedderConfig, Dict]],
-    ids: Optional[List[str]] = None,
-    descriptions: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """Embed sequences using embedder or config, return matrix/ids/descriptions."""
-    if embedder is not None:
-        matrix = _ensure_2d(embedder.embed(seqs, return_numpy=True))
-        return {
-            "matrix": matrix,
-            "ids": ids or [f"seq_{i}" for i in range(len(seqs))],
-            "descriptions": descriptions or [""] * len(seqs),
-        }
-    if embedder_config is not None:
-        return embed_protein(embedder_config, sequences=seqs, verbose=True)
-    raise ValueError("ProteinEmbedder or embedder_config is required.")
-
-
-def _format_hits(indices: np.ndarray, distances: np.ndarray, metadata: List[Dict]) -> List[Dict]:
-    """Format search results into hit list."""
-    hits = []
-    for rank, (idx, dist) in enumerate(zip(indices.tolist(), distances.tolist()), 1):
-        if idx == -1:
-            continue
-        meta = metadata[idx] if idx < len(metadata) else {"id": str(idx), "description": ""}
-        hits.append({
-            "rank": rank,
-            "id": meta.get("id", str(idx)),
-            "description": meta.get("description", ""),
-            "distance": float(dist),
-        })
-    return hits
-
-
-# ---------------------------------------------------------------------------
-# BioVecDB Class
-# ---------------------------------------------------------------------------
 
 class BioVecDB:
     """Protein embedding index built on FAISS for semantic search."""
@@ -70,7 +34,7 @@ class BioVecDB:
         embedder: Optional[ProteinEmbedder] = None,
         embedder_config: Optional[Union[str, Dict[str, Any]]] = None,
     ):
-        self.indexer = FaissIndexer(dim, metric=metric, use_gpu=use_gpu, verbose=True)
+        self.indexer = FaissIndexer(dim, metric=metric, use_gpu=False, verbose=True)
         self.metadata: List[Dict[str, str]] = []
         self.embedder = embedder
         self.embedder_config = (
@@ -93,7 +57,7 @@ class BioVecDB:
     ) -> None:
         """Add precomputed embeddings and their ids to the index."""
         descriptions = descriptions or [""] * len(ids)
-        emb = _ensure_2d(embeddings)
+        emb = ensure_2d(embeddings)
 
         if emb.shape[0] != len(ids) or len(descriptions) != len(ids):
             raise ValueError("ids/descriptions length must match embeddings rows.")
@@ -112,17 +76,17 @@ class BioVecDB:
         if not records:
             return
         ids, descriptions, seqs = map(list, zip(*records))
-        out = _embed_sequences(seqs, embedder or self.embedder, self.embedder_config, ids, descriptions)
+        out = embed_sequences(seqs, embedder or self.embedder, self.embedder_config, ids, descriptions)
         self.add_embeddings(out["matrix"], out["ids"], out["descriptions"])
 
     def search(self, sequence: str, embedder: Optional[ProteinEmbedder] = None, top_k: int = 10) -> List[Dict]:
         """Search index with a single sequence, return ranked hits."""
-        out = _embed_sequences([sequence], embedder or self.embedder, self.embedder_config)
-        q = _ensure_2d(out["matrix"])
+        out = embed_sequences([sequence], embedder or self.embedder, self.embedder_config)
+        q = ensure_2d(out["matrix"])
         if q.shape[1] != self.dim:
             raise ValueError("Query dimension mismatch.")
         D, I = self.indexer.search(q, top_k)
-        return _format_hits(I[0], D[0], self.metadata)
+        return format_hits(I[0], D[0], self.metadata)
 
     def save(self, base_path: str) -> None:
         """Save index and metadata to disk."""
@@ -169,16 +133,25 @@ def build_db(
     embedder_config: Optional[Union[str, Dict[str, Any]]] = None,
     save_path: Optional[str] = None,
 ) -> BioVecDB:
-    """Build a BioVecDB from a FASTA file (embed + index)."""
+    """Build a BioVecDB from a FASTA file (embed + index).
+    
+    Output files (when save_path is provided):
+        {save_path}.faiss - FAISS index
+        {save_path}.meta.json - Metadata (ids, descriptions, embedder_config)
+        {save_path}.h5 - Embeddings matrix
+        {save_path}.fasta - Copy of the original input FASTA file
+        {save_path}.sequences.json - ID to sequence mapping
+    """
     records = read_fasta(fasta_file)
     if not records:
         db = BioVecDB(dim=512, metric=metric, embedder=embedder, embedder_config=embedder_config)
         if save_path:
             db.save(save_path)
+            save_sequences(save_path, [], [], fasta_file)
         return db
 
     ids, descriptions, seqs = map(list, zip(*records))
-    out = _embed_sequences(seqs, embedder, embedder_config, ids, descriptions)
+    out = embed_sequences(seqs, embedder, embedder_config, ids, descriptions)
     matrix = out["matrix"]
 
     db = BioVecDB(dim=int(matrix.shape[1]), metric=metric, embedder=embedder, embedder_config=embedder_config)
@@ -191,6 +164,7 @@ def build_db(
             "ids": np.asarray(out["ids"], dtype=object),
             "descriptions": np.asarray(out["descriptions"], dtype=object),
         })
+        save_sequences(save_path, out["ids"], seqs, fasta_file)
     return db
 
 
@@ -216,14 +190,14 @@ def search_db(
         if not records:
             return []
         q_ids, _, q_seqs = map(list, zip(*records))
-        out = _embed_sequences(q_seqs, embedder or db.embedder, db.embedder_config)
-        q_embs = _ensure_2d(out["matrix"])
+        out = embed_sequences(q_seqs, embedder or db.embedder, db.embedder_config)
+        q_embs = ensure_2d(out["matrix"])
     else:
-        q_embs = _ensure_2d(query_embeddings)
+        q_embs = ensure_2d(query_embeddings)
         q_ids = [str(i) for i in range(q_embs.shape[0])]
 
     if q_embs.shape[1] != db.dim:
         raise ValueError("Query dimension mismatch.")
 
     D, I = db.indexer.search(q_embs, top_k)
-    return [{"query_id": qid, "hits": _format_hits(inds, dists, db.metadata)} for qid, inds, dists in zip(q_ids, I, D)]
+    return [{"query_id": qid, "hits": format_hits(inds, dists, db.metadata)} for qid, inds, dists in zip(q_ids, I, D)]
