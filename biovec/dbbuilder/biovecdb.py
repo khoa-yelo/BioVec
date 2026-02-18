@@ -97,7 +97,7 @@ class BioVecDB:
             json.dump({"metadata": self.metadata, "embedder_config": cfg}, f)
 
     @classmethod
-    def load(cls, base_path: str, use_gpu: bool = True, metric: str = "cosine") -> "BioVecDB":
+    def load(cls, base_path: str, use_gpu: bool = False, metric: str = "cosine") -> "BioVecDB":
         """Load index and metadata from disk."""
         indexer = FaissIndexer.load(f"{base_path}.faiss", metric=metric, use_gpu=use_gpu)
         obj = cls(dim=int(indexer.index.d), metric=metric, use_gpu=use_gpu)
@@ -168,9 +168,9 @@ def build_db(
     return db
 
 
-def load_db(base_path: str, *, metric: str = "cosine") -> BioVecDB:
+def load_db(base_path: str, *, metric: str = "cosine", use_gpu: bool = False) -> BioVecDB:
     """Load a previously saved BioVecDB."""
-    return BioVecDB.load(base_path, metric=metric)
+    return BioVecDB.load(base_path, metric=metric, use_gpu=use_gpu)
 
 
 def search_db(

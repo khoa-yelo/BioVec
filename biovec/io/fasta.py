@@ -80,3 +80,59 @@ def csv_to_fasta(
     write_fasta(fasta_path, records)
     return len(records)
 
+
+def fasta_to_csv(
+    fasta_path: str,
+    csv_path: str,
+    id_col: str = "id",
+    seq_col: str = "sequence",
+    desc_col: Optional[str] = "description",
+    delimiter: str = ",",
+    include_length: bool = False,
+) -> int:
+    """
+    Convert a FASTA file to CSV format.
+
+    Args:
+        fasta_path: Path to input FASTA file.
+        csv_path: Path to output CSV file.
+        id_col: Column name for sequence ID (default: "id").
+        seq_col: Column name for sequence (default: "sequence").
+        desc_col: Column name for description (default: "description").
+                  Set to None to exclude description column.
+        delimiter: CSV delimiter (default: ",").
+        include_length: Include a "length" column with sequence length (default: False).
+
+    Returns:
+        Number of sequences written.
+
+    Example:
+        >>> fasta_to_csv("proteins.fasta", "proteins.csv")
+        100
+        >>> fasta_to_csv("proteins.fasta", "proteins.tsv", delimiter="\\t", include_length=True)
+        100
+    """
+    records = read_fasta(fasta_path)
+
+    # Build header
+    fieldnames = [id_col]
+    if desc_col:
+        fieldnames.append(desc_col)
+    fieldnames.append(seq_col)
+    if include_length:
+        fieldnames.append("length")
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=delimiter)
+        writer.writeheader()
+
+        for rid, desc, seq in records:
+            row = {id_col: rid, seq_col: seq}
+            if desc_col:
+                row[desc_col] = desc
+            if include_length:
+                row["length"] = len(seq)
+            writer.writerow(row)
+
+    return len(records)
+

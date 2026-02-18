@@ -17,7 +17,6 @@ from ..dbbuilder.biovecdb import BioVecDB, build_db
 from ..dbbuilder.utils import load_sequences
 from ..io.h5 import read_h5
 from .stats import (
-    normalize_embeddings,
     compute_cluster_cohesion as _compute_cluster_cohesion,
     compute_cohesion_summary,
     find_cluster_representative,
@@ -44,7 +43,7 @@ class Clusterer:
     
     Example:
         >>> clusterer = Clusterer("/path/to/biovecdb_output")
-        >>> result = clusterer.cluster(k=30, dist_threshold=0.1, resolution=0.1)
+        >>> result = clusterer.leiden_cluster(k=30, dist_threshold=0.1, resolution=0.1)
         >>> print(f"Found {result.n_clusters} clusters")
     """
     
@@ -202,7 +201,7 @@ class Clusterer:
         
         return g
     
-    def cluster(
+    def leiden_cluster(
         self,
         k: int = 30,
         dist_threshold: float = 0.1,
@@ -221,7 +220,7 @@ class Clusterer:
             ClusterResult containing labels and cluster statistics.
         """
         if self.verbose:
-            print(f"[Clusterer] Starting clustering: k={k}, dist_threshold={dist_threshold}, resolution={resolution}")
+            print(f"[Clusterer] Starting Leiden clustering: k={k}, dist_threshold={dist_threshold}, resolution={resolution}")
         
         # Build KNN graph
         g = self.build_graph(k=k, dist_threshold=dist_threshold)
@@ -250,6 +249,87 @@ class Clusterer:
             ids=self.ids,
             descriptions=self.descriptions,
             modularity=modularity,
+        )
+
+    def cluster(
+        self,
+        k: int = 30,
+        dist_threshold: float = 0.1,
+        resolution: float = 0.1,
+    ) -> ClusterResult:
+        """Backward-compatible alias for leiden_cluster()."""
+        return self.leiden_cluster(k=k, dist_threshold=dist_threshold, resolution=resolution)
+
+    def mst_cluster(
+        self,
+        k: int = 30,
+        knn_dist_threshold: float = 0.1,
+        cut_threshold: float = 0.1,
+    ) -> ClusterResult:
+        """
+        Build an MST from the KNN graph and cut edges above a threshold.
+
+        Args:
+            k: Number of nearest neighbors for KNN graph.
+            knn_dist_threshold: Max distance for KNN edges (pre-filter before MST).
+            cut_threshold: Cut MST edges with distance > threshold to form clusters.
+
+        Returns:
+            ClusterResult with labels and NaN modularity.
+        """
+        if self.verbose:
+            print(f"[Clusterer] Starting MST clustering: k={k}, knn_dist_threshold={knn_dist_threshold}, cut_threshold={cut_threshold}")
+
+        D, I = self.search_knn(k)
+        # Convert to distances
+        dist = 1.0 - D if self.metric == "cosine" else D
+
+        # Build edge list (exclude invalid/self)
+        mask = (I != -1)
+        if knn_dist_threshold is not None:
+            mask &= (dist < knn_dist_threshold)
+
+        for i in range(self.n_samples):
+            for j in range(k):
+                if I[i, j] == i:
+                    mask[i, j] = False
+
+        rows, cols = np.where(mask)
+        edges = list(zip(rows.tolist(), I[rows, cols].tolist()))
+        weights = dist[rows, cols].tolist()
+
+        if len(edges) == 0:
+            labels = np.arange(self.n_samples)
+            return ClusterResult(
+                labels=labels,
+                n_clusters=len(labels),
+                ids=self.ids,
+                descriptions=self.descriptions,
+                modularity=float("nan"),
+            )
+
+        g = ig.Graph(n=self.n_samples, edges=edges, edge_attrs={"weight": weights})
+        tree = g.spanning_tree(weights="weight")
+
+        # Cut edges above threshold
+        if cut_threshold is not None:
+            to_delete = [e.index for e in tree.es if e["weight"] > cut_threshold]
+            if to_delete:
+                tree.delete_edges(to_delete)
+
+        comps = tree.components()
+        labels = np.array(comps.membership)
+        n_clusters = len(set(labels))
+
+        if self.verbose:
+            print(f"[Clusterer] MST clustering produced {n_clusters} clusters")
+
+        return ClusterResult(
+            labels=labels,
+            n_clusters=n_clusters,
+            ids=self.ids,
+            descriptions=self.descriptions,
+            modularity=float("nan"),
         )
     
     def get_cluster_members(self, result: ClusterResult, cluster_id: int) -> Dict:
@@ -452,6 +532,8 @@ def cluster_db(
     resolution: float = 0.1,
     min_cluster_size: int = 2,
     sequence_alignment: bool = False,
+    method: str = "leiden",
+    mst_cut_threshold: float = 0.1,
     use_gpu: bool = False,
     verbose: bool = True,
 ) -> ClusterResult:
@@ -466,6 +548,8 @@ def cluster_db(
         resolution: Leiden resolution parameter.
         min_cluster_size: Minimum cluster size for cohesion stats.
         sequence_alignment: If True, compute pairwise sequence identity within clusters.
+        method: Clustering method: "leiden" or "mst".
+        mst_cut_threshold: Distance threshold for cutting MST edges when method="mst".
         use_gpu: Whether to use GPU for FAISS.
         verbose: Print progress information.
         
@@ -484,7 +568,16 @@ def cluster_db(
     
     # Initialize clusterer and run clustering
     clusterer = Clusterer(db_path, use_gpu=use_gpu, verbose=verbose)
-    result = clusterer.cluster(k=k, dist_threshold=dist_threshold, resolution=resolution)
+    if method == "leiden":
+        result = clusterer.leiden_cluster(k=k, dist_threshold=dist_threshold, resolution=resolution)
+    elif method == "mst":
+        result = clusterer.mst_cluster(
+            k=k,
+            knn_dist_threshold=dist_threshold,
+            cut_threshold=mst_cut_threshold,
+        )
+    else:
+        raise ValueError(f"Unknown clustering method: {method}")
     
     if verbose:
         print(f"[cluster_db] Computing cluster statistics...")
@@ -567,9 +660,11 @@ def cluster_db(
     # Add clustering parameters to summary
     full_summary = {
         "db_path": db_path,
+        "method": method,
         "k": k,
         "dist_threshold": dist_threshold,
         "resolution": resolution,
+        "mst_cut_threshold": mst_cut_threshold,
         "n_samples": clusterer.n_samples,
         "n_clusters": result.n_clusters,
         "modularity": result.modularity,
@@ -599,6 +694,8 @@ def cluster_sequences(
     resolution: float = 0.1,
     min_cluster_size: int = 2,
     sequence_alignment: bool = False,
+    method: str = "leiden",
+    mst_cut_threshold: float = 0.1,
     use_gpu: bool = False,
     verbose: bool = True,
 ) -> ClusterResult:
@@ -620,6 +717,8 @@ def cluster_sequences(
         resolution: Leiden resolution parameter.
         min_cluster_size: Minimum cluster size for cohesion stats.
         sequence_alignment: If True, compute pairwise sequence identity within clusters.
+        method: Clustering method: "leiden" or "mst".
+        mst_cut_threshold: Distance threshold for cutting MST edges when method="mst".
         use_gpu: Whether to use GPU for embedding and FAISS.
         verbose: Print progress information.
         
@@ -674,6 +773,8 @@ def cluster_sequences(
         resolution=resolution,
         min_cluster_size=min_cluster_size,
         sequence_alignment=sequence_alignment,
+            method=method,
+            mst_cut_threshold=mst_cut_threshold,
         use_gpu=use_gpu,
         verbose=verbose,
     )

@@ -76,6 +76,97 @@ def cmd_csv_to_fasta(args):
     print(f"[biovec] Converted {count:,} sequences → {args.output}")
 
 
+def cmd_cluster(args):
+    """Cluster a BioVecDB or FASTA file."""
+    from .clusterer import cluster_db, cluster_sequences
+
+    verbose = not args.quiet
+
+    if args.fasta:
+        result = cluster_sequences(
+            fasta_file=args.fasta,
+            output_path=args.output,
+            embedder_config=args.embedder_config,
+            k=args.k,
+            dist_threshold=args.dist_threshold,
+            resolution=args.resolution,
+            min_cluster_size=args.min_cluster_size,
+            sequence_alignment=args.sequence_alignment,
+            method=args.method,
+            mst_cut_threshold=args.mst_cut_threshold,
+            use_gpu=args.use_gpu,
+            verbose=verbose,
+        )
+    else:
+        result = cluster_db(
+            db_path=args.database,
+            output_path=args.output,
+            k=args.k,
+            dist_threshold=args.dist_threshold,
+            resolution=args.resolution,
+            min_cluster_size=args.min_cluster_size,
+            sequence_alignment=args.sequence_alignment,
+            method=args.method,
+            mst_cut_threshold=args.mst_cut_threshold,
+            use_gpu=args.use_gpu,
+            verbose=verbose,
+        )
+
+    if verbose:
+        print(f"[biovec] {result.n_clusters} clusters from {len(result.labels)} sequences "
+              f"(modularity={result.modularity:.4f})")
+        print(f"[biovec] Output → {args.output}.*")
+
+
+def cmd_find_peak(args):
+    """Detect peaks in a score column of a CSV/TSV file."""
+    from .peakfinder import find_peak_in_csv
+
+    intervals, df = find_peak_in_csv(
+        csv_path=args.input,
+        score_col=args.score_col,
+        output_path=args.output,
+        smooth_size=args.smooth_size,
+        prominence=args.prominence,
+        distance=args.distance,
+        rel_height=args.rel_height,
+        flip_score=not args.no_flip,
+        verbose=not args.quiet,
+    )
+
+    if not args.quiet:
+        n_det = int(df["detected"].sum())
+        print(f"[biovec] {len(intervals)} interval(s), {n_det}/{len(df)} rows detected")
+        for i, (s, e) in enumerate(intervals):
+            print(f"  interval {i}: rows {s}–{e} (span {e - s + 1})")
+        if args.output:
+            print(f"[biovec] Output → {args.output}")
+
+
+def cmd_remote_score(args):
+    """Score query proteins against a database and output TSV."""
+    from .peakfinder import remote_score
+    
+    # Determine input type
+    fasta = args.fasta if args.fasta else None
+    embeddings_h5 = args.embeddings if args.embeddings else None
+    query_db = args.query_db if args.query_db else None
+    
+    n_scored = remote_score(
+        db_path=args.database,
+        output_path=args.output,
+        fasta=fasta,
+        embeddings_h5=embeddings_h5,
+        query_db=query_db,
+        use_gpu=args.use_gpu,
+        metric=args.metric,
+        verbose=not args.quiet,
+    )
+    
+    if not args.quiet:
+        print(f"[biovec] Scored {n_scored:,} queries → {args.output}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="biovec",
@@ -147,6 +238,196 @@ def main():
     p_csv.add_argument("--delimiter", default=",", help="CSV delimiter")
     p_csv.add_argument("--no-header", action="store_true", help="CSV has no header row")
     p_csv.set_defaults(func=cmd_csv_to_fasta)
+
+    # -------------------------------------------------------------------------
+    # cluster
+    # -------------------------------------------------------------------------
+    p_clust = subparsers.add_parser(
+        "cluster",
+        help="Cluster proteins using Leiden or MST algorithm",
+        description="Cluster a BioVecDB or FASTA file using KNN graph + Leiden/MST. "
+                    "Writes clusters.tsv, cluster_stats.tsv, and summary.tsv.",
+    )
+    # Input (mutually exclusive: existing DB or raw FASTA)
+    clust_input = p_clust.add_mutually_exclusive_group(required=True)
+    clust_input.add_argument(
+        "--database", "-d",
+        help="Existing BioVecDB base path (without extension)",
+    )
+    clust_input.add_argument(
+        "--fasta", "-f",
+        help="Input FASTA file (will build DB first, then cluster)",
+    )
+    # Output
+    p_clust.add_argument(
+        "--output", "-o",
+        required=True,
+        help="Output path prefix for result files",
+    )
+    # Clustering method
+    p_clust.add_argument(
+        "--method",
+        choices=["leiden", "mst"],
+        default="leiden",
+        help="Clustering method (default: leiden)",
+    )
+    # KNN parameters
+    p_clust.add_argument("--k", type=int, default=30, help="Number of nearest neighbors (default: 30)")
+    p_clust.add_argument(
+        "--dist-threshold",
+        type=float,
+        default=0.1,
+        help="Max cosine distance for KNN edges (default: 0.1)",
+    )
+    # Leiden parameters
+    p_clust.add_argument(
+        "--resolution",
+        type=float,
+        default=0.1,
+        help="Leiden resolution parameter (default: 0.1)",
+    )
+    # MST parameters
+    p_clust.add_argument(
+        "--mst-cut-threshold",
+        type=float,
+        default=0.1,
+        help="MST edge cut threshold, only for method=mst (default: 0.1)",
+    )
+    # Stats options
+    p_clust.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=2,
+        help="Min cluster size for cohesion stats (default: 2)",
+    )
+    p_clust.add_argument(
+        "--sequence-alignment",
+        action="store_true",
+        help="Compute pairwise sequence identity within clusters",
+    )
+    # Embedder (only for --fasta mode)
+    p_clust.add_argument(
+        "--embedder-config", "-e",
+        default=None,
+        help="Embedder config (glm2, esm2, t5, or YAML path). Only used with --fasta.",
+    )
+    # Runtime
+    p_clust.add_argument("--use-gpu", action="store_true", help="Use GPU for FAISS operations")
+    p_clust.add_argument("--quiet", "-Q", action="store_true", help="Suppress progress output")
+    p_clust.set_defaults(func=cmd_cluster)
+
+    # -------------------------------------------------------------------------
+    # find-peak
+    # -------------------------------------------------------------------------
+    p_peak = subparsers.add_parser(
+        "find-peak",
+        help="Detect peaks/intervals in a score column of a CSV/TSV",
+        description="Run peak detection on a score column from a CSV/TSV file. "
+                    "Adds a 'detected' column (1 inside interval, 0 outside) and "
+                    "reports the detected intervals.",
+    )
+    p_peak.add_argument(
+        "--input", "-i",
+        required=True,
+        help="Input CSV or TSV file",
+    )
+    p_peak.add_argument(
+        "--score-col", "-s",
+        required=True,
+        help="Column name containing scores to analyse",
+    )
+    p_peak.add_argument(
+        "--output", "-o",
+        default=None,
+        help="Output CSV/TSV with added 'detected' column (default: print only)",
+    )
+    p_peak.add_argument(
+        "--smooth-size",
+        type=int,
+        default=20,
+        help="Gaussian smoothing sigma (default: 20)",
+    )
+    p_peak.add_argument(
+        "--prominence",
+        type=float,
+        default=0.1,
+        help="Peak prominence threshold (default: 0.1)",
+    )
+    p_peak.add_argument(
+        "--distance",
+        type=int,
+        default=5,
+        help="Minimum distance between peaks (default: 5)",
+    )
+    p_peak.add_argument(
+        "--rel-height",
+        type=float,
+        default=0.15,
+        help="Relative height for peak width calculation (default: 0.15)",
+    )
+    p_peak.add_argument(
+        "--no-flip",
+        action="store_true",
+        help="Do NOT flip scores (by default scores are flipped to detect valleys)",
+    )
+    p_peak.add_argument(
+        "--quiet", "-Q",
+        action="store_true",
+        help="Suppress progress output",
+    )
+    p_peak.set_defaults(func=cmd_find_peak)
+
+    # -------------------------------------------------------------------------
+    # remote-score
+    # -------------------------------------------------------------------------
+    p_rscore = subparsers.add_parser(
+        "remote-score",
+        help="Score query proteins against a database",
+        description="Score query proteins against a BioVecDB and output TSV with "
+                    "nearest neighbor information (query_id, score, neighbor_id, neighbor_description).",
+    )
+    p_rscore.add_argument(
+        "--database", "-d",
+        required=True,
+        help="Target database base path (BioVecDB without extension)",
+    )
+    p_rscore.add_argument(
+        "--output", "-o",
+        required=True,
+        help="Output TSV file path",
+    )
+    # Query input (mutually exclusive)
+    query_group = p_rscore.add_mutually_exclusive_group(required=True)
+    query_group.add_argument(
+        "--fasta", "-f",
+        help="Query FASTA file (will embed using database's embedder config)",
+    )
+    query_group.add_argument(
+        "--embeddings", "-e",
+        help="Query embeddings H5 file (must have 'matrix' dataset)",
+    )
+    query_group.add_argument(
+        "--query-db", "-q",
+        help="Query BioVecDB base path (without extension)",
+    )
+    # Options
+    p_rscore.add_argument(
+        "--metric",
+        default="cosine",
+        choices=["cosine", "euclidean"],
+        help="Distance metric (default: cosine)",
+    )
+    p_rscore.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="Use GPU for FAISS operations",
+    )
+    p_rscore.add_argument(
+        "--quiet", "-Q",
+        action="store_true",
+        help="Suppress progress output",
+    )
+    p_rscore.set_defaults(func=cmd_remote_score)
 
     # -------------------------------------------------------------------------
     # Parse and run
